@@ -47,10 +47,10 @@ so a row can be copied into AP's file with no reshaping. Everything after
 | po_number | text | blank if none |
 | po_line | number | blank unless the document itself references a specific PO line |
 | category | text | must be exactly one of `AP_CATEGORIES` (`config.py`), or blank if nothing genuinely fits — e.g. a grocery/retail receipt. Blank flags `category_unresolved` |
-| qty_invoiced | number | `1` for a collapsed multi-item receipt — see `line_items` below |
-| unit_price | number | `subtotal` for a collapsed receipt |
+| qty_invoiced | number | Total quantity, filled only when every line shares one unit price and qty × price reproduces the line amounts and subtotal (`sheets_client.py::confirmed_qty_and_price()`); blank otherwise — see `line_items` below |
+| unit_price | number | The common per-unit price under the same confirmation rule; blank when not confirmed |
 | total | number | |
-| currency | text | e.g. `USD`, `CAD` |
+| currency | text | e.g. `USD`, `CAD` — only when the document states it; blank for a bare `$` |
 | invoice_date | date | |
 | subtotal | number | AP's own schema has no tax field — this and `tax` are this agent's addition |
 | tax | number | |
@@ -58,7 +58,7 @@ so a row can be copied into AP's file with no reshaping. Everything after
 | logged_at | datetime | set once, at append time |
 | source | text | `drive` or `email` |
 | file_name | text | original file name |
-| line_items | text | plain text, not JSON: `description ($amount); description ($amount)`. The only place a multi-item receipt's itemization survives — `qty_invoiced`/`unit_price` collapse it to one row. Built by `sheets_client.py::format_line_items()` |
+| line_items | text | plain text, not JSON: `description ($amount); description ($amount)`. The only place a mixed-price receipt's itemization survives — `qty_invoiced`/`unit_price` stay blank when the lines don't share one price. Built by `sheets_client.py::format_line_items()` |
 | review_status | text | `verified` or `needs_review` |
 | issue | text | blank, or a `;`-separated list of which checks failed |
 | approve_vendor | boolean | human sets to `TRUE` to approve adding a new vendor found on this row |

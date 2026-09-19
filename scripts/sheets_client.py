@@ -163,14 +163,50 @@ def _format_amount(amount) -> str:
 def format_line_items(line_items: list[dict]) -> str:
     """Plain-text rendering, e.g. 'Widget ($12.50); Gadget (-$2.00)' — not
     JSON, so a non-technical reader doesn't have to parse braces and quotes.
-    This is the only place a multi-item receipt's itemization survives:
-    qty_invoiced/unit_price collapse it to a single row."""
+    This is the only place a mixed-price receipt's itemization survives:
+    qty_invoiced/unit_price stay blank unless the lines confirm one pair."""
     if not line_items:
         return ""
     return "; ".join(
         f"{item.get('description', '') or '(no description)'} ({_format_amount(item.get('amount', 0))})"
         for item in line_items
     )
+
+
+def confirmed_qty_and_price(line_items: list[dict], subtotal) -> tuple:
+    """(qty_invoiced, unit_price) for the log row, or ("", "") when the
+    document doesn't confirm a single pair — a blank beats an invented value.
+
+    Confirmed means every priced line carries the same unit price, and
+    total quantity x that price reproduces both the sum of the line amounts
+    and the subtotal (within $0.02). One line qualifies on its own; two
+    44 SF lines at $2.25 collapse to 88 x $2.25. Zero-amount lines (terms,
+    notes and disclaimers some invoices print as $0.00 rows) carry no price
+    and are ignored. Anything else — mixed prices, a missing quantity or
+    price, amounts that don't reconcile — stays blank; `line_items` still
+    holds the full itemization."""
+    try:
+        line_items = [item for item in line_items or [] if float(item.get("amount") or 0) != 0]
+    except (AttributeError, TypeError, ValueError):
+        return "", ""
+    if not line_items:
+        return "", ""
+    try:
+        quantities = [float(item["quantity"]) for item in line_items]
+        prices = [float(item["unit_price"]) for item in line_items]
+        amounts = [float(item["amount"]) for item in line_items]
+        subtotal = float(subtotal)
+    except (KeyError, TypeError, ValueError):
+        return "", ""
+    if any(q <= 0 for q in quantities) or any(p <= 0 for p in prices):
+        return "", ""
+    if max(prices) - min(prices) > 0.005:
+        return "", ""
+
+    qty, price, amount_sum = sum(quantities), prices[0], sum(amounts)
+    if abs(qty * price - amount_sum) > 0.02 or abs(amount_sum - subtotal) > 0.02:
+        return "", ""
+    return (int(qty) if qty == int(qty) else qty), price
 
 
 def _read_records(spreadsheet_id: str, header: list[str]) -> list[dict]:
@@ -256,10 +292,12 @@ def get_invoice_log_rows() -> list[dict]:
 def append_invoice_row(record: dict, source: str, status: str, issues: list[str]) -> None:
     """Appends a row to Invoice_Log in the AP-Agent-matching schema.
 
-    Multi-item receipts (no formal qty/unit_price on the document) collapse
-    to a single row: qty_invoiced=1, unit_price=subtotal. The full
-    itemization is preserved in the line_items column.
+    qty_invoiced/unit_price are filled only when the line items confirm them
+    (see confirmed_qty_and_price) and are left blank otherwise, never
+    defaulted to 1 x subtotal. The full itemization is preserved in the
+    line_items column.
     """
+    qty_invoiced, unit_price = confirmed_qty_and_price(record.get("line_items"), record.get("subtotal"))
     values = {
         "invoice_number": record.get("invoice_number") or "",
         "vendor_id": record.get("vendor_id") or "",
@@ -267,8 +305,8 @@ def append_invoice_row(record: dict, source: str, status: str, issues: list[str]
         "po_number": record.get("po_number") or "",
         "po_line": record.get("po_line") or "",
         "category": record.get("category") or "",
-        "qty_invoiced": record.get("qty_invoiced", 1),
-        "unit_price": record.get("unit_price", record.get("subtotal", 0)),
+        "qty_invoiced": qty_invoiced,
+        "unit_price": unit_price,
         "total": record.get("total", 0),
         "currency": record.get("currency") or "",
         "invoice_date": record.get("invoice_date") or "",

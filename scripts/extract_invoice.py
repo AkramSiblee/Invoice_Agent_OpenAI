@@ -6,6 +6,7 @@ plain retail receipts (Walmart, etc.) alike.
 import base64
 import json
 import mimetypes
+import re
 from pathlib import Path
 
 from openai import OpenAI
@@ -33,7 +34,7 @@ _FIELDS_DESCRIPTION = f"""- vendor: the vendor/merchant name
 - category: EXACTLY one of the following, or null if none genuinely fits:
 {_CATEGORY_LIST}
   Do not force a fit — e.g. a grocery or general retail receipt (food, household goods) fits none of these; return null rather than picking the closest-sounding one.
-- currency: e.g. "USD\""""
+- currency: the ISO code (e.g. "CAD", "USD") ONLY when the document itself states it — a printed "CAD"/"USD", "C$", "US$", etc. A bare "$" does not say which dollar, so return null for it; never infer the currency from the vendor's name, address, or tax type."""
 
 EXTRACTION_PROMPT = f"""You are reading a vendor invoice or store receipt (it may be a PDF or a photo of a paper receipt, e.g. from Walmart or any other shop).
 
@@ -91,7 +92,7 @@ _INVOICE_FIELDS = {
     "po_number": {"type": ["string", "null"]},
     "po_line": {"type": ["integer", "null"]},
     "category": {"type": ["string", "null"], "enum": [*AP_CATEGORIES, None]},
-    "currency": {"type": "string"},
+    "currency": {"type": ["string", "null"]},
 }
 
 
@@ -168,11 +169,23 @@ def _run_extraction(
     return record
 
 
+# intake_drive.py saves downloads as "<DriveFileID>__<name>" so same-named files
+# in different folders can't overwrite each other locally. Drive file ids are
+# 28-44 chars of [A-Za-z0-9_-]; non-greedy so a "__" inside the real name
+# survives.
+_DRIVE_ID_PREFIX = re.compile(r"^[A-Za-z0-9_-]{28,44}?__")
+
+
+def _source_name(file_path: str) -> str:
+    """The name to log for a local file: its real name, without intake_drive's id prefix."""
+    return _DRIVE_ID_PREFIX.sub("", Path(file_path).name, count=1)
+
+
 def extract_invoice_data(file_path: str) -> dict:
     """Send a PDF or image to OpenAI and return the extracted fields as a dict."""
     content = [_file_content_block(file_path), {"type": "input_text", "text": EXTRACTION_PROMPT}]
     record = _run_extraction(
-        content, "invoice_extraction", EXTRACTION_SCHEMA, Path(file_path).name, allow_not_an_invoice=False
+        content, "invoice_extraction", EXTRACTION_SCHEMA, _source_name(file_path), allow_not_an_invoice=False
     )
     if record is None:
         raise ValueError(f"Unexpected not_an_invoice response for a file extraction: {file_path}")
