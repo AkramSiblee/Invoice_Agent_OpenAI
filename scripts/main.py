@@ -23,46 +23,43 @@ import intake_drive
 import intake_gmail
 
 
-def process_new_invoices():
-    master_vendors = get_master_vendors()
-    # Loaded once and appended to in-memory as we go, so two copies of the
-    # same invoice arriving from different sources in the same run (e.g.
-    # emailed AND dropped in the watched Drive folder) still catch each other,
-    # not just invoices that were already in the sheet before this run.
-    existing_rows = get_invoice_log_rows()
+def _extract(kind, payload, label):
+    if kind == "file":
+        return extract_invoice_data(payload)
+    return extract_invoice_data_from_text(payload, label)
 
-    # Each job is (source_name, kind, payload, label): kind "file" means
-    # payload is a local path (extract_invoice_data); kind "text" means
-    # payload is an email body string (extract_invoice_data_from_text).
-    # label is what gets logged/printed — the filename for "file" jobs, the
-    # subject/message-id description intake_gmail.py built for "text" jobs.
-    jobs = [("drive", "file", file_path, file_path) for file_path in intake_drive.fetch_new_files()]
-    for source in intake_gmail.fetch_new_invoice_sources():
-        if source["kind"] == "file":
-            jobs.append(("email", "file", source["path"], source["path"]))
-        else:
-            jobs.append(("email", "text", source["text"], source["label"]))
+
+def process_jobs(jobs, master_vendors, existing_rows):
+    """Runs extract -> validate -> log -> notify for a list of jobs.
+
+    Each job is (source_name, kind, payload, label): kind "file" means
+    payload is a local path (extract_invoice_data); kind "text" means
+    payload is an email body string (extract_invoice_data_from_text).
+    label is what gets logged/printed — the filename for "file" jobs, the
+    subject/message-id description intake_gmail.py built for "text" jobs.
+
+    `master_vendors` and `existing_rows` are mutated in place (existing_rows
+    grows as rows are appended) so a caller can invoke this repeatedly across
+    several smaller batches within one run and still catch cross-batch
+    duplicates.
+
+    Extraction is the slow, token-spending step (one OpenAI call per file),
+    and each call is fully independent — no shared conversation, no state
+    carried between invoices — so token cost per invoice stays flat
+    regardless of batch size. That independence is exactly what makes it
+    safe to fan these calls out to a bounded pool of concurrent workers:
+    wall-clock time on a large batch drops from O(n) sequential API round
+    trips to roughly O(n / MAX_CONCURRENT_EXTRACTIONS), which is what
+    actually matters as invoice volume grows.
+
+    Everything after extraction (validate, append, notify) stays
+    single-threaded on the main thread: it's cheap local logic, not an API
+    call, and the duplicate check depends on existing_rows being updated
+    one invoice at a time — parallelizing it would just add races for no
+    benefit.
+    """
     if not jobs:
         return
-
-    # Extraction is the slow, token-spending step (one OpenAI call per file),
-    # and each call is fully independent — no shared conversation, no state
-    # carried between invoices — so token cost per invoice stays flat
-    # regardless of batch size. That independence is exactly what makes it
-    # safe to fan these calls out to a bounded pool of concurrent workers:
-    # wall-clock time on a large batch drops from O(n) sequential API round
-    # trips to roughly O(n / MAX_CONCURRENT_EXTRACTIONS), which is what
-    # actually matters as invoice volume grows.
-    #
-    # Everything after extraction (validate, append, notify) stays
-    # single-threaded on the main thread: it's cheap local logic, not an API
-    # call, and the duplicate check depends on existing_rows being updated
-    # one invoice at a time — parallelizing it would just add races for no
-    # benefit.
-    def _extract(kind, payload, label):
-        if kind == "file":
-            return extract_invoice_data(payload)
-        return extract_invoice_data_from_text(payload, label)
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EXTRACTIONS) as pool:
         futures = {
@@ -88,6 +85,23 @@ def process_new_invoices():
             except Exception:
                 print(f"[error] {label}")
                 traceback.print_exc()
+
+
+def process_new_invoices():
+    master_vendors = get_master_vendors()
+    # Loaded once and appended to in-memory as we go, so two copies of the
+    # same invoice arriving from different sources in the same run (e.g.
+    # emailed AND dropped in the watched Drive folder) still catch each other,
+    # not just invoices that were already in the sheet before this run.
+    existing_rows = get_invoice_log_rows()
+
+    jobs = [("drive", "file", file_path, file_path) for file_path in intake_drive.fetch_new_files()]
+    for source in intake_gmail.fetch_new_invoice_sources():
+        if source["kind"] == "file":
+            jobs.append(("email", "file", source["path"], source["path"]))
+        else:
+            jobs.append(("email", "text", source["text"], source["label"]))
+    process_jobs(jobs, master_vendors, existing_rows)
 
 
 def apply_approved_vendors():

@@ -87,8 +87,14 @@ def _walk(service, root_id):
                 yield child, prefix
 
 
-def fetch_new_files() -> list[str]:
+def fetch_new_files(root_id: str | None = None) -> list[str]:
     """Downloads any new files in the watched tree and returns local paths.
+
+    `root_id` scopes the walk to a specific subfolder (e.g. a one-off run
+    against a single newly-added client folder) instead of the full watched
+    tree. Defaults to `DRIVE_WATCH_FOLDER_ID`. The per-source ledger and
+    dedup layers below apply the same way regardless of scope, so a file
+    seen via a scoped run is still correctly skipped by a later full run.
 
     Two layers keep this from double-processing the same invoice:
     1. `processed` (this file's ledger) skips a Drive file ID we've already
@@ -98,13 +104,13 @@ def fetch_new_files() -> list[str]:
        already archived by `intake_gmail.py` and also dropped by hand into
        a month folder.
     """
-    require(DRIVE_WATCH_FOLDER_ID, "DRIVE_WATCH_FOLDER_ID")
+    root_id = root_id or require(DRIVE_WATCH_FOLDER_ID, "DRIVE_WATCH_FOLDER_ID")
     service = _service()
     processed = _load_ledger()
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     new_paths = []
-    for f, folder_path in _walk(service, DRIVE_WATCH_FOLDER_ID):
+    for f, folder_path in _walk(service, root_id):
         if f["id"] in processed:
             continue
 
