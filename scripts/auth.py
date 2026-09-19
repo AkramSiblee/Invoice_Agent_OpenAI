@@ -9,6 +9,7 @@ Run scripts/authorize.py once to perform the browser consent.
 """
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -39,9 +40,15 @@ def get_credentials(interactive: bool = False) -> Credentials:
         return creds
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        TOKEN_PATH.write_text(creds.to_json())
-        return creds
+        try:
+            creds.refresh(Request())
+            TOKEN_PATH.write_text(creds.to_json())
+            return creds
+        except RefreshError:
+            # Refresh token itself was revoked/expired (e.g. unused >6 months,
+            # or consent revoked) -- fall through to a fresh interactive
+            # consent instead of crashing, same as if no token existed at all.
+            creds = None
 
     if not interactive:
         raise RuntimeError(
