@@ -159,6 +159,7 @@ Run scripts/authorize.py once to perform the browser consent.
 """
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -189,9 +190,15 @@ def get_credentials(interactive: bool = False) -> Credentials:
         return creds
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        TOKEN_PATH.write_text(creds.to_json())
-        return creds
+        try:
+            creds.refresh(Request())
+            TOKEN_PATH.write_text(creds.to_json())
+            return creds
+        except RefreshError:
+            # Refresh token itself was revoked/expired (e.g. unused >6 months,
+            # or consent revoked) -- fall through to a fresh interactive
+            # consent instead of crashing, same as if no token existed at all.
+            creds = None
 
     if not interactive:
         raise RuntimeError(
@@ -330,6 +337,7 @@ plain retail receipts (Walmart, etc.) alike.
 import base64
 import json
 import mimetypes
+import re
 from pathlib import Path
 
 from openai import OpenAI
@@ -347,13 +355,17 @@ _FIELDS_DESCRIPTION = f"""- vendor: the vendor/merchant name
 - invoice_number: use the receipt/transaction number if there's no formal invoice number; null if truly absent
 - invoice_date: YYYY-MM-DD
 - line_items: description, quantity, unit_price, amount for each line
-- subtotal, tax, total: numbers
+- subtotal, tax, total: numbers. The true `total` is the amount on the line literally labeled TOTAL (or, if genuinely absent, the highest subtotal-like figure before any payment breakdown begins). Below that TOTAL line, receipts often print a payment breakdown — one line per tender (VISA, MASTERCARD, DEBIT, INTERAC, CASH, CHEQUING, etc.), each usually next to a masked card number (e.g. "XXXXXXXXXXXX1234") or an AUTH CODE. Amounts on those tender lines are portions of how the total was paid, NOT the total itself — a split payment (e.g. part VISA + remaining balance on DEBIT) means no single tender line equals the total, and even a single-tender payment shouldn't be used to read the total when an explicit TOTAL line exists above it. Never take a number from a line containing a masked card number, AUTH CODE, or a payment-method word as subtotal, tax, or total.
+
+  Some receipts (fuel pumps especially) price tax-INCLUSIVE: the "Sub Total"/"TOTAL" lines already have tax baked into the unit price, so the receipt's own subtotal-labeled line equals its total, and any "tax on" line shows $0.00 — but the receipt separately discloses the embedded tax elsewhere, e.g. "Fuel Includes GST 5.0% $4.29". When you see a disclosure like that, don't report tax as $0: compute subtotal = total - disclosed_tax, and tax = the disclosed amount, so subtotal + tax still equals total. Only do this when the document explicitly discloses the embedded tax amount — never estimate or back-calculate a tax that isn't printed anywhere on the document.
+
+  When you apply that adjustment, also carry it into `line_items`: each affected line's `amount` (and `unit_price`, if quantity is 1) must be its tax-EXCLUSIVE share, not the tax-inclusive figure printed on the receipt — so `line_items` amounts still sum to `subtotal`. E.g. a pump line printed as "Fuel $100.00" with disclosed "Includes GST 5.0% $4.76" should be reported as amount $95.24, not $100.00.
 - po_number: null if not present
 - po_line: a line number on the PO (e.g. "line 2" or "item 2") — only if the document itself references one; never guess
 - category: EXACTLY one of the following, or null if none genuinely fits:
 {_CATEGORY_LIST}
   Do not force a fit — e.g. a grocery or general retail receipt (food, household goods) fits none of these; return null rather than picking the closest-sounding one.
-- currency: e.g. "USD\""""
+- currency: the ISO code (e.g. "CAD", "USD") ONLY when the document itself states it — a printed "CAD"/"USD", "C$", "US$", etc. A bare "$" does not say which dollar, so return null for it; never infer the currency from the vendor's name, address, or tax type."""
 
 EXTRACTION_PROMPT = f"""You are reading a vendor invoice or store receipt (it may be a PDF or a photo of a paper receipt, e.g. from Walmart or any other shop).
 
@@ -362,6 +374,8 @@ Extract these fields:
 {_FIELDS_DESCRIPTION}
 
 If a field genuinely isn't present on the document, use null (or 0 for money you can compute from other fields). Never invent a value that isn't visibly on the document. If line items aren't itemized (e.g. a simple receipt with just a total), return a single line item with a reasonable description and the total amount.
+
+If the scan/photo is faint, blurry, or has overlapping/garbled text, still read every visible line item — don't silently drop a line just because its description is hard to make out. If a line's amount is legible but its description isn't, use a description like "(item illegible in scan)" rather than omitting the line or inventing wording that isn't really there. When reconstructing subtotal/tax/total, prefer the document's own printed SUBTOTAL/TAX/TOTAL figures over summing line items you're unsure you read correctly — a low-confidence per-line reading is more likely to be wrong than the printed summary figures.
 """
 
 # Used for email bodies matched by subject line alone (see intake_gmail.py's
@@ -409,7 +423,7 @@ _INVOICE_FIELDS = {
     "po_number": {"type": ["string", "null"]},
     "po_line": {"type": ["integer", "null"]},
     "category": {"type": ["string", "null"], "enum": [*AP_CATEGORIES, None]},
-    "currency": {"type": "string"},
+    "currency": {"type": ["string", "null"]},
 }
 
 
@@ -486,11 +500,23 @@ def _run_extraction(
     return record
 
 
+# intake_drive.py saves downloads as "<DriveFileID>__<name>" so same-named files
+# in different folders can't overwrite each other locally. Drive file ids are
+# 28-44 chars of [A-Za-z0-9_-]; non-greedy so a "__" inside the real name
+# survives.
+_DRIVE_ID_PREFIX = re.compile(r"^[A-Za-z0-9_-]{28,44}?__")
+
+
+def _source_name(file_path: str) -> str:
+    """The name to log for a local file: its real name, without intake_drive's id prefix."""
+    return _DRIVE_ID_PREFIX.sub("", Path(file_path).name, count=1)
+
+
 def extract_invoice_data(file_path: str) -> dict:
     """Send a PDF or image to OpenAI and return the extracted fields as a dict."""
     content = [_file_content_block(file_path), {"type": "input_text", "text": EXTRACTION_PROMPT}]
     record = _run_extraction(
-        content, "invoice_extraction", EXTRACTION_SCHEMA, Path(file_path).name, allow_not_an_invoice=False
+        content, "invoice_extraction", EXTRACTION_SCHEMA, _source_name(file_path), allow_not_an_invoice=False
     )
     if record is None:
         raise ValueError(f"Unexpected not_an_invoice response for a file extraction: {file_path}")
@@ -840,14 +866,50 @@ def _format_amount(amount) -> str:
 def format_line_items(line_items: list[dict]) -> str:
     """Plain-text rendering, e.g. 'Widget ($12.50); Gadget (-$2.00)' — not
     JSON, so a non-technical reader doesn't have to parse braces and quotes.
-    This is the only place a multi-item receipt's itemization survives:
-    qty_invoiced/unit_price collapse it to a single row."""
+    This is the only place a mixed-price receipt's itemization survives:
+    qty_invoiced/unit_price stay blank unless the lines confirm one pair."""
     if not line_items:
         return ""
     return "; ".join(
         f"{item.get('description', '') or '(no description)'} ({_format_amount(item.get('amount', 0))})"
         for item in line_items
     )
+
+
+def confirmed_qty_and_price(line_items: list[dict], subtotal) -> tuple:
+    """(qty_invoiced, unit_price) for the log row, or ("", "") when the
+    document doesn't confirm a single pair — a blank beats an invented value.
+
+    Confirmed means every priced line carries the same unit price, and
+    total quantity x that price reproduces both the sum of the line amounts
+    and the subtotal (within $0.02). One line qualifies on its own; two
+    44 SF lines at $2.25 collapse to 88 x $2.25. Zero-amount lines (terms,
+    notes and disclaimers some invoices print as $0.00 rows) carry no price
+    and are ignored. Anything else — mixed prices, a missing quantity or
+    price, amounts that don't reconcile — stays blank; `line_items` still
+    holds the full itemization."""
+    try:
+        line_items = [item for item in line_items or [] if float(item.get("amount") or 0) != 0]
+    except (AttributeError, TypeError, ValueError):
+        return "", ""
+    if not line_items:
+        return "", ""
+    try:
+        quantities = [float(item["quantity"]) for item in line_items]
+        prices = [float(item["unit_price"]) for item in line_items]
+        amounts = [float(item["amount"]) for item in line_items]
+        subtotal = float(subtotal)
+    except (KeyError, TypeError, ValueError):
+        return "", ""
+    if any(q <= 0 for q in quantities) or any(p <= 0 for p in prices):
+        return "", ""
+    if max(prices) - min(prices) > 0.005:
+        return "", ""
+
+    qty, price, amount_sum = sum(quantities), prices[0], sum(amounts)
+    if abs(qty * price - amount_sum) > 0.02 or abs(amount_sum - subtotal) > 0.02:
+        return "", ""
+    return (int(qty) if qty == int(qty) else qty), price
 
 
 def _read_records(spreadsheet_id: str, header: list[str]) -> list[dict]:
@@ -932,10 +994,12 @@ def get_invoice_log_rows() -> list[dict]:
 def append_invoice_row(record: dict, source: str, status: str, issues: list[str]) -> None:
     """Appends a row to Invoice_Log.
 
-    Multi-item receipts (no formal qty/unit_price on the document) collapse
-    to a single row: qty_invoiced=1, unit_price=subtotal. The full
-    itemization is preserved in the line_items column.
+    qty_invoiced/unit_price are filled only when the line items confirm them
+    (see confirmed_qty_and_price) and are left blank otherwise, never
+    defaulted to 1 x subtotal. The full itemization is preserved in the
+    line_items column.
     """
+    qty_invoiced, unit_price = confirmed_qty_and_price(record.get("line_items"), record.get("subtotal"))
     values = {
         "invoice_number": record.get("invoice_number") or "",
         "vendor_id": record.get("vendor_id") or "",
@@ -943,8 +1007,8 @@ def append_invoice_row(record: dict, source: str, status: str, issues: list[str]
         "po_number": record.get("po_number") or "",
         "po_line": record.get("po_line") or "",
         "category": record.get("category") or "",
-        "qty_invoiced": record.get("qty_invoiced", 1),
-        "unit_price": record.get("unit_price", record.get("subtotal", 0)),
+        "qty_invoiced": qty_invoiced,
+        "unit_price": unit_price,
         "total": record.get("total", 0),
         "currency": record.get("currency") or "",
         "invoice_date": record.get("invoice_date") or "",
@@ -1075,8 +1139,14 @@ def _walk(service, root_id):
                 yield child, prefix
 
 
-def fetch_new_files() -> list[str]:
+def fetch_new_files(root_id: str | None = None) -> list[str]:
     """Downloads any new files in the watched tree and returns local paths.
+
+    `root_id` scopes the walk to a specific subfolder (e.g. a one-off run
+    against a single newly-added client folder) instead of the full watched
+    tree. Defaults to `DRIVE_WATCH_FOLDER_ID`. The per-source ledger and
+    dedup layers below apply the same way regardless of scope, so a file
+    seen via a scoped run is still correctly skipped by a later full run.
 
     Two layers keep this from double-processing the same invoice:
     1. `processed` (this file's ledger) skips a Drive file ID we've already
@@ -1086,13 +1156,13 @@ def fetch_new_files() -> list[str]:
        already archived by `intake_gmail.py` and also dropped by hand into
        a month folder.
     """
-    require(DRIVE_WATCH_FOLDER_ID, "DRIVE_WATCH_FOLDER_ID")
+    root_id = root_id or require(DRIVE_WATCH_FOLDER_ID, "DRIVE_WATCH_FOLDER_ID")
     service = _service()
     processed = _load_ledger()
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     new_paths = []
-    for f, folder_path in _walk(service, DRIVE_WATCH_FOLDER_ID):
+    for f, folder_path in _walk(service, root_id):
         if f["id"] in processed:
             continue
 
@@ -1446,46 +1516,43 @@ import intake_drive
 import intake_gmail
 
 
-def process_new_invoices():
-    master_vendors = get_master_vendors()
-    # Loaded once and appended to in-memory as we go, so two copies of the
-    # same invoice arriving from different sources in the same run (e.g.
-    # emailed AND dropped in the watched Drive folder) still catch each other,
-    # not just invoices that were already in the sheet before this run.
-    existing_rows = get_invoice_log_rows()
+def _extract(kind, payload, label):
+    if kind == "file":
+        return extract_invoice_data(payload)
+    return extract_invoice_data_from_text(payload, label)
 
-    # Each job is (source_name, kind, payload, label): kind "file" means
-    # payload is a local path (extract_invoice_data); kind "text" means
-    # payload is an email body string (extract_invoice_data_from_text).
-    # label is what gets logged/printed — the filename for "file" jobs, the
-    # subject/message-id description intake_gmail.py built for "text" jobs.
-    jobs = [("drive", "file", file_path, file_path) for file_path in intake_drive.fetch_new_files()]
-    for source in intake_gmail.fetch_new_invoice_sources():
-        if source["kind"] == "file":
-            jobs.append(("email", "file", source["path"], source["path"]))
-        else:
-            jobs.append(("email", "text", source["text"], source["label"]))
+
+def process_jobs(jobs, master_vendors, existing_rows):
+    """Runs extract -> validate -> log -> notify for a list of jobs.
+
+    Each job is (source_name, kind, payload, label): kind "file" means
+    payload is a local path (extract_invoice_data); kind "text" means
+    payload is an email body string (extract_invoice_data_from_text).
+    label is what gets logged/printed — the filename for "file" jobs, the
+    subject/message-id description intake_gmail.py built for "text" jobs.
+
+    `master_vendors` and `existing_rows` are mutated in place (existing_rows
+    grows as rows are appended) so a caller can invoke this repeatedly across
+    several smaller batches within one run and still catch cross-batch
+    duplicates.
+
+    Extraction is the slow, token-spending step (one OpenAI call per file),
+    and each call is fully independent — no shared conversation, no state
+    carried between invoices — so token cost per invoice stays flat
+    regardless of batch size. That independence is exactly what makes it
+    safe to fan these calls out to a bounded pool of concurrent workers:
+    wall-clock time on a large batch drops from O(n) sequential API round
+    trips to roughly O(n / MAX_CONCURRENT_EXTRACTIONS), which is what
+    actually matters as invoice volume grows.
+
+    Everything after extraction (validate, append, notify) stays
+    single-threaded on the main thread: it's cheap local logic, not an API
+    call, and the duplicate check depends on existing_rows being updated
+    one invoice at a time — parallelizing it would just add races for no
+    benefit.
+    """
     if not jobs:
         return
-
-    # Extraction is the slow, token-spending step (one OpenAI call per file),
-    # and each call is fully independent — no shared conversation, no state
-    # carried between invoices — so token cost per invoice stays flat
-    # regardless of batch size. That independence is exactly what makes it
-    # safe to fan these calls out to a bounded pool of concurrent workers:
-    # wall-clock time on a large batch drops from O(n) sequential API round
-    # trips to roughly O(n / MAX_CONCURRENT_EXTRACTIONS), which is what
-    # actually matters as invoice volume grows.
-    #
-    # Everything after extraction (validate, append, notify) stays
-    # single-threaded on the main thread: it's cheap local logic, not an API
-    # call, and the duplicate check depends on existing_rows being updated
-    # one invoice at a time — parallelizing it would just add races for no
-    # benefit.
-    def _extract(kind, payload, label):
-        if kind == "file":
-            return extract_invoice_data(payload)
-        return extract_invoice_data_from_text(payload, label)
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EXTRACTIONS) as pool:
         futures = {
@@ -1511,6 +1578,23 @@ def process_new_invoices():
             except Exception:
                 print(f"[error] {label}")
                 traceback.print_exc()
+
+
+def process_new_invoices():
+    master_vendors = get_master_vendors()
+    # Loaded once and appended to in-memory as we go, so two copies of the
+    # same invoice arriving from different sources in the same run (e.g.
+    # emailed AND dropped in the watched Drive folder) still catch each other,
+    # not just invoices that were already in the sheet before this run.
+    existing_rows = get_invoice_log_rows()
+
+    jobs = [("drive", "file", file_path, file_path) for file_path in intake_drive.fetch_new_files()]
+    for source in intake_gmail.fetch_new_invoice_sources():
+        if source["kind"] == "file":
+            jobs.append(("email", "file", source["path"], source["path"]))
+        else:
+            jobs.append(("email", "text", source["text"], source["label"]))
+    process_jobs(jobs, master_vendors, existing_rows)
 
 
 def apply_approved_vendors():
@@ -1805,10 +1889,10 @@ agent's own addition.
 | po_number | text | blank if none |
 | po_line | number | blank unless the document itself references a specific PO line |
 | category | text | must be exactly one of `AP_CATEGORIES` (`config.py`), or blank if nothing genuinely fits — e.g. a grocery/retail receipt. Blank flags `category_unresolved` |
-| qty_invoiced | number | `1` for a collapsed multi-item receipt — see `line_items` below |
-| unit_price | number | `subtotal` for a collapsed receipt |
+| qty_invoiced | number | Total quantity, filled only when every line shares one unit price and qty × price reproduces the line amounts and subtotal (`sheets_client.py::confirmed_qty_and_price()`); blank otherwise — see `line_items` below |
+| unit_price | number | The common per-unit price under the same confirmation rule; blank when not confirmed |
 | total | number | |
-| currency | text | e.g. `USD`, `CAD` |
+| currency | text | e.g. `USD`, `CAD` — only when the document states it; blank for a bare `$` |
 | invoice_date | date | |
 | subtotal | number | |
 | tax | number | |
@@ -1816,7 +1900,7 @@ agent's own addition.
 | logged_at | datetime | set once, at append time |
 | source | text | `drive` or `email` |
 | file_name | text | original file name |
-| line_items | text | plain text, not JSON: `description ($amount); description ($amount)`. The only place a multi-item receipt's itemization survives — `qty_invoiced`/`unit_price` collapse it to one row. Built by `sheets_client.py::format_line_items()` |
+| line_items | text | plain text, not JSON: `description ($amount); description ($amount)`. The only place a mixed-price receipt's itemization survives — `qty_invoiced`/`unit_price` stay blank when the lines don't share one price. Built by `sheets_client.py::format_line_items()` |
 | review_status | text | `verified` or `needs_review` |
 | issue | text | blank, or a `;`-separated list of which checks failed |
 | approve_vendor | boolean | human sets to `TRUE` to approve adding a new vendor found on this row |
@@ -1981,7 +2065,7 @@ It keeps its own `Vendor_Master`/`Invoice_Log` Google Sheets in an "Agent Data" 
 1. `scripts/intake_drive.py` / `scripts/intake_gmail.py` — pull new files, track what's already been processed in `state/`, and skip anything `scripts/dedup.py` recognizes as already-seen content. `intake_gmail.py` also archives each new attachment into the watched Drive folder's `Attachments from Gmail` subfolder.
 2. `scripts/extract_invoice.py` — OpenAI (Responses API, Structured Outputs) reads the PDF/image and returns JSON matching `EXTRACTION_SCHEMA`/`TEXT_EXTRACTION_SCHEMA` (the prompt text is `EXTRACTION_PROMPT`/`TEXT_EXTRACTION_PROMPT` in that file), including a best-effort `category` from the fixed `AP_CATEGORIES` list (`config.py`) — null if nothing genuinely fits (e.g. a grocery receipt)
 3. `scripts/validate_invoice.py::validate_invoice` — resolves `vendor_id` and checks: vendor match, category validity, math check, PO check, duplicate check (see `references/validation_rules.md`)
-4. `scripts/sheets_client.py::append_invoice_row` — logs the row to the `Invoice_Log` sheet, stamping `logged_at`, collapsing multi-item receipts to one row (`qty_invoiced=1`, `unit_price=subtotal`), and rendering `line_items` as plain text (via `format_line_items()`), not JSON — see `references/sheet_schema.md`
+4. `scripts/sheets_client.py::append_invoice_row` — logs the row to the `Invoice_Log` sheet, stamping `logged_at`, filling `qty_invoiced`/`unit_price` only when the line items confirm them (blank otherwise, never defaulted to 1 × subtotal), and rendering `line_items` as plain text (via `format_line_items()`), not JSON — see `references/sheet_schema.md`
 5. `scripts/notify.py` — emails a human if validation failed
 6. `scripts/main.py::apply_approved_vendors` — on the next run, picks up any row where a human set `approve_vendor = TRUE`, adds a **minimal** `Pending`-status vendor row to the `Vendor_Master` sheet (only `vendor_id`/`vendor_name`/`aliases` — everything else needs a human to complete it directly in the sheet), writes the new `vendor_id` back onto the triggering invoice row, and re-validates it
 
